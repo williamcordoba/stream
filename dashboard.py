@@ -1,187 +1,215 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
-from sqlalchemy import create_engine
+import mysql.connector
 from datetime import datetime, timedelta
 import time
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # Configuración de la página
 st.set_page_config(
-    page_title="Dashboard Transacciones en Tiempo Real",
+    page_title="Dashboard Tickets NOC",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Configuración de la base de datos
-db_config = {
-    "user": "powerbi",
-    "password": "ytmfxN8DUsfm4",
-    "host": "10.41.235.23",
-    "port": "5432",
-    "dbname": "productiondb"
-}
-
-# Crear conexión con PostgreSQL
+# Conexión a la base de datos (usar secrets en producción)
 @st.cache_resource
-def create_db_connection():
+def init_connection():
     try:
-        engine = create_engine(
-            f"postgresql+psycopg2://{db_config['user']}:{db_config['password']}@{db_config['host']}:{db_config['port']}/{db_config['dbname']}"
+        conn = mysql.connector.connect(
+            host=st.secrets["DB_HOST"],
+            database=st.secrets["DB_NAME"],
+            user=st.secrets["DB_USER"],
+            password=st.secrets["DB_PASSWORD"],
+            port=st.secrets.get("DB_PORT", 3306)
         )
-        return engine
+        return conn
     except Exception as e:
-        st.error(f"Error al conectar con la base de datos: {e}")
+        st.error(f"Error de conexión: {e}")
         return None
 
-# Consulta SQL con filtro de fecha dinámico
-def get_query(hours_back=24):
-    return f"""
-    select 
-        case 
-        WHEN t.idgatewayrule IN(1,2,645) THEN 'Agregador' 
-        ELSE 'Gateway' 
-        END AS tipopasarela,
-        c."name" AS comercio,
-        s."name" AS servicio, 
-        DATE(t2.transdate) AS fecha,
-        t3.description AS status,
-        g2."name" AS pasarela,
-        coalesce(errmsgpgw,t.responsepgw) AS respuesta,
-        a.cardtype AS tipotarjeta,
-        a.franchise AS franquicia,
-        a.issuingbank,    	
-        COUNT(t.idtransaction) AS cantidad_transacciones, 
-        SUM(t2.billvalue) AS valor
-    FROM trns.transretries t
-    inner join trns.transactions t2 on t2.idtransaction = t.idtransaction 
-    inner join trns.transactionstatus t3 on t3.idstatus = t2.status 
-    inner join assc.services s on s.idservice = t2.idservice 
-    inner join assc.commerces c on t2.idcommerce = c.idcommerce
-    inner join pycl.gatewayrules g on g.idgatewayrule = t.idgatewayrule  
-    inner join pycl.gateway g2 on g2.idgateway = g.idgateway 
-    inner join gpac.acccards a on a.idcard = t.idcard 
-    WHERE  coalesce (errmsgpgw,'') NOT IN('INVALID_REQUEST','type card not allowed')
-    AND t2.transdate >= NOW() - INTERVAL '{hours_back} hours'
-    group by 
-        case when t.idgatewayrule in(1,2,645) then 'Agregador' else 'Gateway' end,
-        c."name",
-        s."name",
-        DATE(t2.transdate),
-        t3.description,
-        g2."name",
-        coalesce(errmsgpgw,t.responsepgw),
-        a.cardtype,
-        a.franchise, 
-        a.issuingbank;
-    """
-
-# Obtener datos de la base de datos
+# Función para ejecutar tu query
 @st.cache_data(ttl=300)  # Cache por 5 minutos
-def get_data(hours_back=24):
-    engine = create_db_connection()
-    if engine:
+def get_tickets_data(fecha_inicio, fecha_fin):
+    query = f"""
+    SELECT
+        tickets.Usuario_Asignado,
+        tickets.Ticket_ID AS ID_Tickets,
+        DATE(tickets.`Fecha solucion`) AS Fecha_solucion,
+        estado_solicitud.`Estado Solicitud`,
+        tickets.Grupo
+    FROM 
+    (
+        SELECT 'EN CURSO' AS `Estado Solicitud`
+        UNION ALL
+        SELECT 'RESUELTO'
+        UNION ALL
+        SELECT 'CERRADO'
+    ) AS estado_solicitud
+    LEFT JOIN 
+    (
+        SELECT 
+            gt.id AS Ticket_ID, 
+            CASE
+                WHEN gt.status = 5 THEN 'RESUELTO'
+                WHEN gt.status = 6 THEN 'CERRADO'
+            END AS `Estado Solicitud`,
+            gt.solvedate AS `Fecha solucion`,
+            gt.name,
+            ge.name AS Entidad,
+            (
+             SELECT gg.name 
+             FROM glpi_groups_tickets ggt 
+             INNER JOIN glpi_groups gg ON gg.id = ggt.groups_id
+             WHERE ggt.tickets_id = gt.id 
+               AND ggt.type = 2
+               AND gg.name = 'NOC'
+             LIMIT 1
+            ) AS Grupo,
+            gu.name AS Usuario_Asignado,
+            gl.name AS Comercio,
+            gl.completename AS Comercio_completo
+        FROM 
+            glpi_tickets gt
+        INNER JOIN 
+            glpi_entities ge ON ge.id = gt.entities_id  
+        INNER JOIN 
+            glpi_users gu ON gu.id = gt.users_id_recipient 
+        LEFT JOIN 
+            glpi_locations gl ON gl.id = gt.locations_id 
+        WHERE 
+            gt.solvedate BETWEEN '{fecha_inicio}' AND '{fecha_fin}'
+             AND gt.id IS NOT NULL
+             AND gt.is_deleted = 0
+    ) AS tickets
+    ON 
+        estado_solicitud.`Estado Solicitud` = tickets.`Estado Solicitud`
+    WHERE tickets.Grupo IS NOT NULL
+    GROUP BY 
+        estado_solicitud.`Estado Solicitud`,
+        tickets.Usuario_Asignado,
+        DATE(tickets.`Fecha solucion`),
+        tickets.Grupo
+    """
+    
+    conn = init_connection()
+    if conn:
         try:
-            query = get_query(hours_back)
-            df = pd.read_sql_query(query, engine)
+            df = pd.read_sql(query, conn)
+            conn.close()
             return df
         except Exception as e:
-            st.error(f"Error al ejecutar la consulta: {e}")
+            st.error(f"Error ejecutando query: {e}")
             return pd.DataFrame()
     return pd.DataFrame()
 
-# Sidebar para controles
-with st.sidebar:
-    st.title("⚙️ Controles del Dashboard")
+# Función para crear visualizaciones
+def create_visualizations(df):
+    if df.empty:
+        st.warning("No hay datos para mostrar")
+        return
     
-    horas_atras = st.slider(
-        "Período de análisis (horas atrás):",
-        min_value=1,
-        max_value=72,
-        value=24
-    )
-    
-    intervalo_actualizacion = st.slider(
-        "Intervalo de actualización (segundos):",
-        min_value=30,
-        max_value=300,
-        value=60
-    )
-    
-    auto_update = st.checkbox("Actualización automática", value=True)
-    
-    if st.button("Actualizar ahora"):
-        st.cache_data.clear()
-
-# Título principal
-st.title("📊 Dashboard de Transacciones en Tiempo Real")
-st.caption(f"Última actualización: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-# Obtener datos
-df = get_data(horas_atras)
-
-if df.empty:
-    st.warning("No se encontraron datos para el período seleccionado.")
-else:
-    # Mostrar KPIs principales
+    # KPI principales
     col1, col2, col3, col4 = st.columns(4)
     
+    total_tickets = len(df)
+    tickets_resueltos = len(df[df['Estado Solicitud'] == 'RESUELTO'])
+    tickets_cerrados = len(df[df['Estado Solicitud'] == 'CERRADO'])
+    usuarios_activos = df['Usuario_Asignado'].nunique()
+    
     with col1:
-        total_transacciones = df['cantidad_transacciones'].sum()
-        st.metric("Total Transacciones", f"{total_transacciones:,}")
-    
+        st.metric("Total Tickets", total_tickets)
     with col2:
-        total_valor = df['valor'].sum()
-        st.metric("Valor Total", f"${total_valor:,.2f}")
-    
+        st.metric("Resueltos", tickets_resueltos)
     with col3:
-        transacciones_exitosas = df[df['status'] == 'APPROVED']['cantidad_transacciones'].sum()
-        tasa_exito = (transacciones_exitosas / total_transacciones * 100) if total_transacciones > 0 else 0
-        st.metric("Tasa de Éxito", f"{tasa_exito:.2f}%")
-    
+        st.metric("Cerrados", tickets_cerrados)
     with col4:
-        avg_ticket = total_valor / total_transacciones if total_transacciones > 0 else 0
-        st.metric("Ticket Promedio", f"${avg_ticket:.2f}")
+        st.metric("Usuarios Activos", usuarios_activos)
     
     # Gráficos
-    col1, col2 = st.columns(2)
+    col_chart1, col_chart2 = st.columns(2)
     
-    with col1:
-        # Transacciones por tipo de pasarela
-        transacciones_pasarela = df.groupby('tipopasarela')['cantidad_transacciones'].sum().reset_index()
-        fig1 = px.pie(transacciones_pasarela, values='cantidad_transacciones', names='tipopasarela', 
-                     title='Distribución por Tipo de Pasarela')
+    with col_chart1:
+        # Tickets por estado
+        estado_count = df['Estado Solicitud'].value_counts()
+        fig1 = px.pie(
+            values=estado_count.values,
+            names=estado_count.index,
+            title="Distribución por Estado"
+        )
         st.plotly_chart(fig1, use_container_width=True)
     
-    with col2:
-        # Transacciones por estado
-        transacciones_status = df.groupby('status')['cantidad_transacciones'].sum().reset_index()
-        fig2 = px.bar(transacciones_status, x='status', y='cantidad_transacciones', 
-                     title='Transacciones por Estado')
+    with col_chart2:
+        # Tickets por usuario
+        usuario_count = df['Usuario_Asignado'].value_counts().head(10)
+        fig2 = px.bar(
+            x=usuario_count.values,
+            y=usuario_count.index,
+            orientation='h',
+            title="Top 10 Usuarios por Tickets",
+            labels={'x': 'N° Tickets', 'y': 'Usuario'}
+        )
         st.plotly_chart(fig2, use_container_width=True)
     
-    # Transacciones por franquicia
-    transacciones_franquicia = df.groupby('franquicia')['cantidad_transacciones'].sum().reset_index()
-    fig3 = px.bar(transacciones_franquicia, x='franquicia', y='cantidad_transacciones', 
-                 title='Transacciones por Franquicia')
+    # Serie temporal
+    st.subheader("Evolución Temporal")
+    temporal_data = df.groupby(['Fecha_solucion', 'Estado Solicitud']).size().reset_index(name='count')
+    fig3 = px.line(
+        temporal_data,
+        x='Fecha_solucion',
+        y='count',
+        color='Estado Solicitud',
+        title="Tickets por Fecha y Estado"
+    )
     st.plotly_chart(fig3, use_container_width=True)
     
-    # Evolución temporal
-    df['fecha'] = pd.to_datetime(df['fecha'])
-    evolucion = df.groupby('fecha').agg({
-        'cantidad_transacciones': 'sum',
-        'valor': 'sum'
-    }).reset_index()
-    
-    fig4 = px.line(evolucion, x='fecha', y='cantidad_transacciones', 
-                  title='Evolución de Transacciones en el Tiempo')
-    st.plotly_chart(fig4, use_container_width=True)
-    
-    # Mostrar datos tabulares
-    with st.expander("Ver datos detallados"):
-        st.dataframe(df)
+    # Dataframe detallado
+    st.subheader("Detalle de Tickets")
+    st.dataframe(df, use_container_width=True)
 
-# Actualización automática
-if auto_update:
-    time.sleep(intervalo_actualizacion)
-    st.rerun()
+# Interfaz principal
+def main():
+    st.title("📊 Dashboard de Tickets NOC")
+    st.markdown("---")
+    
+    # Selectores de fecha
+    col_fecha1, col_fecha2 = st.columns(2)
+    with col_fecha1:
+        fecha_inicio = st.date_input(
+            "Fecha inicio",
+            value=datetime(2025, 7, 1),
+            min_value=datetime(2020, 1, 1)
+        )
+    with col_fecha2:
+        fecha_fin = st.date_input(
+            "Fecha fin",
+            value=datetime(2025, 8, 8),
+            min_value=datetime(2020, 1, 1)
+        )
+    
+    # Botón para actualizar
+    if st.button("🔄 Actualizar Datos", type="primary"):
+        st.cache_data.clear()
+    
+    # Obtener datos
+    df = get_tickets_data(fecha_inicio, fecha_fin)
+    
+    if not df.empty:
+        create_visualizations(df)
+        
+        # Mostrar última actualización
+        st.sidebar.info(f"Última actualización: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # Estadísticas en sidebar
+        st.sidebar.subheader("📈 Estadísticas")
+        st.sidebar.metric("Total registros", len(df))
+        st.sidebar.metric("Período analizado", f"{fecha_inicio} a {fecha_fin}")
+        
+    else:
+        st.warning("No se encontraron datos para el período seleccionado")
+
+if __name__ == "__main__":
+    main()
