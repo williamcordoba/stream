@@ -1,5 +1,5 @@
-streamlit
-pandas
-sqlalchemy
-psycopg2-binary
-plotly
+DB_HOST = "172.16.0.38"
+DB_NAME = "Gopass"
+DB_USER = "data"
+DB_PASSWORD = "C0mpl1c4d0%.2025"
+DB_PORT = 3306
